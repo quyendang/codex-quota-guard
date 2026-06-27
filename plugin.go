@@ -8,6 +8,7 @@ import (
 	"net/url"
 	"sort"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -18,7 +19,7 @@ import (
 
 const (
 	pluginID      = "codex-quota-guard"
-	pluginVersion = "0.1.0"
+	pluginVersion = "0.1.14"
 	providerCodex = "codex"
 
 	defaultRemainingThresholdPercent = 5.0
@@ -29,6 +30,12 @@ const (
 var (
 	currentConfig atomic.Value
 	quotaStore    = newQuotaState()
+
+	authFileReconcileMu   sync.Mutex
+	lastAuthFileReconcile time.Time
+
+	authFileLoopMu   sync.Mutex
+	authFileLoopStop chan struct{}
 )
 
 type lifecycleRequest struct {
@@ -238,7 +245,10 @@ func handleUsage(raw []byte) ([]byte, error) {
 		return okEnvelope(map[string]any{})
 	}
 	cfg := loadedConfig()
-	quotaStore.applyUsage(record, cfg, time.Now())
+	now := time.Now()
+	action := quotaStore.applyUsage(record, cfg, now)
+	enforceAuthFileBlock(action, now)
+	reconcileDueAuthFiles(now)
 	return okEnvelope(map[string]any{})
 }
 
@@ -247,7 +257,9 @@ func handleSchedulerPick(raw []byte) ([]byte, error) {
 	if errUnmarshal := json.Unmarshal(raw, &req); errUnmarshal != nil {
 		return nil, errUnmarshal
 	}
-	available, filtered := quotaStore.availableCandidates(req.Candidates, time.Now())
+	now := time.Now()
+	reconcileDueAuthFiles(now)
+	available, filtered := quotaStore.availableCandidates(req.Candidates, now)
 	if len(available) == 0 {
 		return okEnvelope(pluginapi.SchedulerPickResponse{Handled: false})
 	}
@@ -278,6 +290,67 @@ func chooseCandidate(candidates []pluginapi.SchedulerAuthCandidate) pluginapi.Sc
 	return chosen
 }
 
+func enforceAuthFileBlock(action *authBlockAction, now time.Time) {
+	if action == nil {
+		return
+	}
+	result, errDisable := disableAuthFileForBlock(*action, now)
+	quotaStore.recordAuthFileDisableResult(action.AuthID, result, errDisable)
+}
+
+func reconcileDueAuthFiles(now time.Time) {
+	for _, authID := range quotaStore.dueAutoUnblockActions(now) {
+		result, errEnable := enableAuthFileIfOwned(authID, now)
+		quotaStore.recordAuthFileEnableResult(authID, result, errEnable)
+	}
+	if !shouldFullAuthFileReconcile(now) {
+		return
+	}
+	reconcileManagedAuthFiles(now)
+}
+
+func shouldFullAuthFileReconcile(now time.Time) bool {
+	authFileReconcileMu.Lock()
+	defer authFileReconcileMu.Unlock()
+	if !lastAuthFileReconcile.IsZero() && now.Sub(lastAuthFileReconcile) < 15*time.Second {
+		return false
+	}
+	lastAuthFileReconcile = now
+	return true
+}
+
+func startAuthFileReconcileLoop() {
+	authFileLoopMu.Lock()
+	defer authFileLoopMu.Unlock()
+	if authFileLoopStop != nil {
+		return
+	}
+	stop := make(chan struct{})
+	authFileLoopStop = stop
+	go func() {
+		ticker := time.NewTicker(time.Minute)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ticker.C:
+				reconcileDueAuthFiles(time.Now())
+			case <-stop:
+				return
+			}
+		}
+	}()
+}
+
+func stopAuthFileReconcileLoop() {
+	authFileLoopMu.Lock()
+	stop := authFileLoopStop
+	authFileLoopStop = nil
+	authFileLoopMu.Unlock()
+	if stop != nil {
+		close(stop)
+	}
+}
+
 func handleManagement(raw []byte) ([]byte, error) {
 	var req managementRequest
 	if len(raw) > 0 {
@@ -289,6 +362,7 @@ func handleManagement(raw []byte) ([]byte, error) {
 	method := strings.ToUpper(strings.TrimSpace(req.Method))
 	switch {
 	case method == http.MethodGet && strings.HasSuffix(path, "/status"):
+		reconcileDueAuthFiles(time.Now())
 		if strings.EqualFold(strings.TrimSpace(req.Query.Get("format")), "json") {
 			return jsonManagementResponse(http.StatusOK, quotaStore.snapshot(time.Now()))
 		}
@@ -298,6 +372,7 @@ func handleManagement(raw []byte) ([]byte, error) {
 			Body:       renderStatusPage(quotaStore.snapshot(time.Now()), loadedConfig()),
 		})
 	case method == http.MethodGet && strings.HasSuffix(path, "/codex-quota-guard/state"):
+		reconcileDueAuthFiles(time.Now())
 		return jsonManagementResponse(http.StatusOK, quotaStore.snapshot(time.Now()))
 	case method == http.MethodPost && strings.HasSuffix(path, "/codex-quota-guard/block"):
 		return handleManualBlock(req.Body)
@@ -346,7 +421,10 @@ func handleManualBlock(body []byte) ([]byte, error) {
 	if reason == "" {
 		reason = "manual block"
 	}
-	quotaStore.manualBlock(authID, time.Now().Add(duration), reason)
+	now := time.Now()
+	until := now.Add(duration)
+	quotaStore.manualBlock(authID, until, reason)
+	enforceAuthFileBlock(&authBlockAction{AuthID: authID, Until: until, Reason: reason, Manual: true}, now)
 	return jsonManagementResponse(http.StatusOK, map[string]any{"status": "ok", "auth_id": authID})
 }
 
@@ -360,6 +438,8 @@ func handleManualUnblock(body []byte) ([]byte, error) {
 		return jsonManagementResponse(http.StatusBadRequest, map[string]any{"error": "auth_id is required"})
 	}
 	quotaStore.unblock(authID)
+	result, errEnable := enableAuthFileIfOwned(authID, time.Now())
+	quotaStore.recordAuthFileEnableResult(authID, result, errEnable)
 	return jsonManagementResponse(http.StatusOK, map[string]any{"status": "ok", "auth_id": authID})
 }
 
@@ -395,11 +475,13 @@ func statusRank(status string) int {
 		return 0
 	case statusManualBlock:
 		return 1
-	case statusNearLimit:
+	case statusAuthDisabled:
 		return 2
-	case statusUsable:
+	case statusNearLimit:
 		return 3
-	default:
+	case statusUsable:
 		return 4
+	default:
+		return 5
 	}
 }

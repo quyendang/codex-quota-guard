@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"strconv"
+	"strings"
 	"testing"
 	"time"
 
@@ -46,6 +47,31 @@ func TestApplyUsageBlocksAtThreshold(t *testing.T) {
 	}
 	got := snap.Credentials[0]
 	if got.Status != statusCooling || got.BlockReason != blockReasonPrimaryThreshold || !got.BlockedUntil.Equal(reset) {
+		t.Fatalf("credential = %+v", got)
+	}
+}
+
+func TestApplyUsageBlocksAtRemainingThirtyPercent(t *testing.T) {
+	now := time.Unix(1700000000, 0)
+	reset := now.Add(2 * time.Hour)
+	cfg := defaultPluginConfig()
+	cfg.RemainingThresholdPercent = 30
+	store := newQuotaState()
+	action := store.applyUsage(pluginapi.UsageRecord{
+		Provider: providerCodex,
+		AuthID:   "auth-70",
+		ResponseHeaders: http.Header{
+			"X-Codex-Primary-Window-Minutes": []string{"300"},
+			"X-Codex-Primary-Used-Percent":   []string{"70"},
+			"X-Codex-Primary-Reset-At":       []string{itoa(reset.Unix())},
+		},
+	}, cfg, now)
+
+	if action == nil || action.AuthID != "auth-70" || !action.Until.Equal(reset) || action.Reason != blockReasonPrimaryThreshold {
+		t.Fatalf("action = %+v, want auth-file block action until %s", action, reset)
+	}
+	got := store.snapshot(now).Credentials[0]
+	if got.Status != statusCooling || got.BlockReason != blockReasonPrimaryThreshold {
 		t.Fatalf("credential = %+v", got)
 	}
 }
@@ -187,6 +213,94 @@ func TestSchedulerFiltersAndLazyUnblocks(t *testing.T) {
 	}
 	if got := store.snapshot(now.Add(2 * time.Hour)).Credentials[0]; got.Status == statusManualBlock || !got.BlockedUntil.IsZero() {
 		t.Fatalf("expected lazy unblock, got %+v", got)
+	}
+}
+
+func TestSchedulerAllFilteredDeclinesSoAuthFileDisableMustEnforce(t *testing.T) {
+	now := time.Unix(1700000000, 0)
+	store := newQuotaState()
+	store.manualBlock("blocked", now.Add(time.Hour), "manual block")
+	candidates := []pluginapi.SchedulerAuthCandidate{
+		{ID: "blocked", Provider: providerCodex, Priority: 100},
+	}
+	available, filtered := store.availableCandidates(candidates, now)
+	if filtered != 1 || len(available) != 0 {
+		t.Fatalf("available = %+v filtered = %d, want all filtered", available, filtered)
+	}
+}
+
+func TestSetAuthFileDisabledAddsOwnedMarker(t *testing.T) {
+	raw := json.RawMessage(`{"type":"codex","email":"a@example.com","disabled":false}`)
+	until := time.Unix(1700003600, 0).UTC()
+	next, changed, managed, message, errMutate := setAuthFileDisabled(raw, true, authFileMarker{
+		DisabledByPlugin: true,
+		AuthID:           "auth-1",
+		BlockedUntil:     until.Format(time.RFC3339),
+		Reason:           blockReasonPrimaryThreshold,
+		UpdatedAt:        time.Unix(1700000000, 0).UTC().Format(time.RFC3339),
+	})
+	if errMutate != nil {
+		t.Fatal(errMutate)
+	}
+	if !changed || !managed || !strings.Contains(message, "disabled") {
+		t.Fatalf("changed=%v managed=%v message=%q", changed, managed, message)
+	}
+	var doc map[string]any
+	if errUnmarshal := json.Unmarshal(next, &doc); errUnmarshal != nil {
+		t.Fatal(errUnmarshal)
+	}
+	if disabled, _ := doc["disabled"].(bool); !disabled {
+		t.Fatalf("disabled = %v, want true", doc["disabled"])
+	}
+	marker, ok := markerFromDoc(doc)
+	if !ok || !marker.DisabledByPlugin || marker.AuthID != "auth-1" || marker.BlockedUntil != until.Format(time.RFC3339) {
+		t.Fatalf("marker = %+v ok=%v", marker, ok)
+	}
+}
+
+func TestSetAuthFileDisabledDoesNotOwnExternalDisable(t *testing.T) {
+	raw := json.RawMessage(`{"type":"codex","email":"a@example.com","disabled":true}`)
+	next, changed, managed, _, errMutate := setAuthFileDisabled(raw, true, authFileMarker{
+		DisabledByPlugin: true,
+		AuthID:           "auth-1",
+	})
+	if errMutate != nil {
+		t.Fatal(errMutate)
+	}
+	if changed || managed || string(next) != string(raw) {
+		t.Fatalf("changed=%v managed=%v next=%s", changed, managed, next)
+	}
+}
+
+func TestSetAuthFileEnableRequiresOwnedMarker(t *testing.T) {
+	raw := json.RawMessage(`{"type":"codex","disabled":true}`)
+	next, changed, managed, _, errMutate := setAuthFileDisabled(raw, false, authFileMarker{DisabledByPlugin: true})
+	if errMutate != nil {
+		t.Fatal(errMutate)
+	}
+	if changed || managed || string(next) != string(raw) {
+		t.Fatalf("changed=%v managed=%v next=%s", changed, managed, next)
+	}
+}
+
+func TestSetAuthFileEnableRemovesOwnedMarker(t *testing.T) {
+	raw := json.RawMessage(`{"type":"codex","disabled":true,"codex_quota_guard":{"disabled_by_plugin":true,"auth_id":"auth-1"}}`)
+	next, changed, managed, message, errMutate := setAuthFileDisabled(raw, false, authFileMarker{DisabledByPlugin: true, AuthID: "auth-1"})
+	if errMutate != nil {
+		t.Fatal(errMutate)
+	}
+	if !changed || !managed || !strings.Contains(message, "enabled") {
+		t.Fatalf("changed=%v managed=%v message=%q", changed, managed, message)
+	}
+	var doc map[string]any
+	if errUnmarshal := json.Unmarshal(next, &doc); errUnmarshal != nil {
+		t.Fatal(errUnmarshal)
+	}
+	if disabled, _ := doc["disabled"].(bool); disabled {
+		t.Fatalf("disabled = true, want false")
+	}
+	if _, ok := doc[authFileMarkerKey]; ok {
+		t.Fatalf("marker still present: %v", doc[authFileMarkerKey])
 	}
 }
 

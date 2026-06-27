@@ -27,7 +27,7 @@ func renderStatusPage(snapshot stateSnapshot, cfg pluginConfig) []byte {
 	writeSummaryItem(&out, "Usable", snapshot.Summary.Usable)
 	writeSummaryItem(&out, "Cooling", snapshot.Summary.Cooling)
 	writeSummaryItem(&out, "Near limit", snapshot.Summary.NearLimit)
-	writeSummaryItem(&out, "Manual", snapshot.Summary.ManualBlock)
+	writeSummaryItem(&out, "Disabled", snapshot.Summary.AuthDisabled)
 	out.WriteString(`</dl></header>`)
 	out.WriteString(`<section class="rail" aria-label="Quota reset rail"><div class="rail-head"><span>5h session rail</span><span>weekly rail</span></div><div id="quota-rail" class="rail-grid"></div></section>`)
 	out.WriteString(`<section class="workspace">`)
@@ -179,7 +179,7 @@ tr.selected { box-shadow: inset 3px 0 0 var(--blue); }
 }
 .status.usable { color: var(--green); background: #f0fdf4; border-color: #bbf7d0; }
 .status.near-limit { color: var(--amber); background: #fffbeb; border-color: #fde68a; }
-.status.cooling, .status.manual-block { color: var(--red); background: #fef2f2; border-color: #fecaca; }
+.status.cooling, .status.manual-block, .status.auth-disabled { color: var(--red); background: #fef2f2; border-color: #fecaca; }
 .meter { width: 118px; height: 6px; background: #eef2f7; border-radius: 999px; overflow: hidden; }
 .meter span { display: block; height: 100%; background: var(--green); border-radius: inherit; }
 .meter.warn span { background: var(--amber); }
@@ -249,7 +249,7 @@ function renderSummary() {
   const s = state.summary || {};
   document.getElementById('summary').innerHTML =
     summaryItem('Usable', s.usable || 0) + summaryItem('Cooling', s.cooling || 0) +
-    summaryItem('Near limit', s.near_limit || 0) + summaryItem('Manual', s.manual_block || 0);
+    summaryItem('Near limit', s.near_limit || 0) + summaryItem('Disabled', s.auth_disabled || 0);
   document.getElementById('generated-at').textContent = 'Updated ' + fmtDate(state.generated_at);
 }
 function summaryItem(k, v) { return '<div><dt>'+esc(k)+'</dt><dd>'+esc(v)+'</dd></div>'; }
@@ -283,6 +283,8 @@ function renderDetail() {
   }
   box.innerHTML = '<div class="panel-head"><h2>'+esc(label(item))+'</h2><span class="status '+esc(item.status)+'">'+esc(item.status)+'</span></div>' +
     '<div class="detail-body"><div class="account">'+esc(item.auth_id)+'</div><p class="muted">'+esc(item.block_reason || 'No active soft block')+'</p>' +
+    '<p class="muted">Auth file '+esc(item.auth_file_name || 'unknown')+' · disabled '+esc(item.auth_file_disabled ? 'yes' : 'no')+' · managed '+esc(item.auth_file_managed ? 'yes' : 'no')+'</p>' +
+    (item.host_error ? '<p class="muted">Host error '+esc(item.host_error)+'</p>' : '') +
     '<div class="windows">'+windowCard('5h window', item.primary)+windowCard('Weekly window', item.secondary)+'</div>' +
     '<div class="actions"><button onclick="unblockSelected()">Unblock</button><button class="secondary" onclick="blockSelected()">Block 1h</button><button class="secondary" onclick="refreshState()">Refresh</button></div></div>';
 }

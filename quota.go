@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"math"
 	"net/http"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -13,10 +14,11 @@ import (
 )
 
 const (
-	statusUsable      = "usable"
-	statusNearLimit   = "near-limit"
-	statusCooling     = "cooling"
-	statusManualBlock = "manual-block"
+	statusUsable       = "usable"
+	statusNearLimit    = "near-limit"
+	statusCooling      = "cooling"
+	statusManualBlock  = "manual-block"
+	statusAuthDisabled = "auth-disabled"
 
 	windowMinutesPrimary   = 300
 	windowMinutesSecondary = 10080
@@ -35,18 +37,23 @@ type quotaState struct {
 }
 
 type credentialState struct {
-	AuthID       string       `json:"auth_id"`
-	Provider     string       `json:"provider"`
-	Label        string       `json:"label,omitempty"`
-	Model        string       `json:"model,omitempty"`
-	Primary      windowState  `json:"primary"`
-	Secondary    windowState  `json:"secondary"`
-	BlockedUntil time.Time    `json:"blocked_until,omitempty"`
-	BlockReason  string       `json:"block_reason,omitempty"`
-	ManualBlock  bool         `json:"manual_block,omitempty"`
-	LastSeen     time.Time    `json:"last_seen,omitempty"`
-	Last429At    time.Time    `json:"last_429_at,omitempty"`
-	LastFailure  usageFailure `json:"last_failure,omitempty"`
+	AuthID           string       `json:"auth_id"`
+	Provider         string       `json:"provider"`
+	Label            string       `json:"label,omitempty"`
+	Model            string       `json:"model,omitempty"`
+	AuthFileName     string       `json:"auth_file_name,omitempty"`
+	AuthFilePath     string       `json:"auth_file_path,omitempty"`
+	AuthFileDisabled bool         `json:"auth_file_disabled,omitempty"`
+	AuthFileManaged  bool         `json:"auth_file_managed,omitempty"`
+	HostError        string       `json:"host_error,omitempty"`
+	Primary          windowState  `json:"primary"`
+	Secondary        windowState  `json:"secondary"`
+	BlockedUntil     time.Time    `json:"blocked_until,omitempty"`
+	BlockReason      string       `json:"block_reason,omitempty"`
+	ManualBlock      bool         `json:"manual_block,omitempty"`
+	LastSeen         time.Time    `json:"last_seen,omitempty"`
+	Last429At        time.Time    `json:"last_429_at,omitempty"`
+	LastFailure      usageFailure `json:"last_failure,omitempty"`
 }
 
 type windowState struct {
@@ -85,41 +92,54 @@ type stateSnapshot struct {
 }
 
 type credentialView struct {
-	AuthID       string       `json:"auth_id"`
-	Provider     string       `json:"provider"`
-	Label        string       `json:"label,omitempty"`
-	Model        string       `json:"model,omitempty"`
-	Status       string       `json:"status"`
-	Primary      windowState  `json:"primary"`
-	Secondary    windowState  `json:"secondary"`
-	BlockedUntil time.Time    `json:"blocked_until,omitempty"`
-	BlockReason  string       `json:"block_reason,omitempty"`
-	ManualBlock  bool         `json:"manual_block,omitempty"`
-	LastSeen     time.Time    `json:"last_seen,omitempty"`
-	Last429At    time.Time    `json:"last_429_at,omitempty"`
-	LastFailure  usageFailure `json:"last_failure,omitempty"`
+	AuthID           string       `json:"auth_id"`
+	Provider         string       `json:"provider"`
+	Label            string       `json:"label,omitempty"`
+	Model            string       `json:"model,omitempty"`
+	AuthFileName     string       `json:"auth_file_name,omitempty"`
+	AuthFilePath     string       `json:"auth_file_path,omitempty"`
+	AuthFileDisabled bool         `json:"auth_file_disabled,omitempty"`
+	AuthFileManaged  bool         `json:"auth_file_managed,omitempty"`
+	HostError        string       `json:"host_error,omitempty"`
+	Status           string       `json:"status"`
+	Primary          windowState  `json:"primary"`
+	Secondary        windowState  `json:"secondary"`
+	BlockedUntil     time.Time    `json:"blocked_until,omitempty"`
+	BlockReason      string       `json:"block_reason,omitempty"`
+	ManualBlock      bool         `json:"manual_block,omitempty"`
+	LastSeen         time.Time    `json:"last_seen,omitempty"`
+	Last429At        time.Time    `json:"last_429_at,omitempty"`
+	LastFailure      usageFailure `json:"last_failure,omitempty"`
 }
 
 type stateSummary struct {
-	Total       int `json:"total"`
-	Usable      int `json:"usable"`
-	NearLimit   int `json:"near_limit"`
-	Cooling     int `json:"cooling"`
-	ManualBlock int `json:"manual_block"`
-	Stale       int `json:"stale"`
+	Total        int `json:"total"`
+	Usable       int `json:"usable"`
+	NearLimit    int `json:"near_limit"`
+	Cooling      int `json:"cooling"`
+	ManualBlock  int `json:"manual_block"`
+	AuthDisabled int `json:"auth_disabled"`
+	Stale        int `json:"stale"`
+}
+
+type authBlockAction struct {
+	AuthID string
+	Until  time.Time
+	Reason string
+	Manual bool
 }
 
 func newQuotaState() *quotaState {
 	return &quotaState{records: make(map[string]*credentialState)}
 }
 
-func (s *quotaState) applyUsage(record pluginapi.UsageRecord, cfg pluginConfig, now time.Time) {
+func (s *quotaState) applyUsage(record pluginapi.UsageRecord, cfg pluginConfig, now time.Time) *authBlockAction {
 	if s == nil {
-		return
+		return nil
 	}
 	authID := strings.TrimSpace(record.AuthID)
 	if authID == "" {
-		return
+		return nil
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -144,9 +164,13 @@ func (s *quotaState) applyUsage(record pluginapi.UsageRecord, cfg pluginConfig, 
 	}
 	if until, reason, ok := decideBlock(record, state, cfg, now); ok {
 		s.blockLocked(state, until, reason, false)
+		if !state.AuthFileDisabled || !state.AuthFileManaged || state.HostError != "" {
+			return &authBlockAction{AuthID: authID, Until: until, Reason: reason}
+		}
 	} else if !record.Failed {
 		s.clearAutoBlockIfRecoveredLocked(state, cfg, now)
 	}
+	return nil
 }
 
 func labelFromUsage(record pluginapi.UsageRecord) string {
@@ -441,6 +465,143 @@ func (s *quotaState) availableCandidates(candidates []pluginapi.SchedulerAuthCan
 	return available, filtered
 }
 
+func (s *quotaState) dueAutoUnblockActions(now time.Time) []string {
+	if s == nil {
+		return nil
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	authIDs := make([]string, 0)
+	for authID, state := range s.records {
+		if state == nil || !state.AuthFileManaged || state.BlockedUntil.IsZero() || state.BlockedUntil.After(now) {
+			continue
+		}
+		authIDs = append(authIDs, authID)
+	}
+	sort.Strings(authIDs)
+	return authIDs
+}
+
+func (s *quotaState) recordAuthFileBlock(authID string, result authFileMutationResult) {
+	if s == nil {
+		return
+	}
+	authID = strings.TrimSpace(authID)
+	if authID == "" {
+		authID = strings.TrimSpace(result.AuthID)
+	}
+	if authID == "" {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	state := s.ensureLocked(authID)
+	state.Provider = providerCodex
+	state.HostError = ""
+	if result.Name != "" {
+		state.AuthFileName = result.Name
+	}
+	if result.Path != "" {
+		state.AuthFilePath = result.Path
+	}
+	state.AuthFileDisabled = result.Disabled
+	state.AuthFileManaged = result.Managed
+	if result.BlockedUntil.After(time.Time{}) && result.BlockedUntil.After(state.BlockedUntil) {
+		state.BlockedUntil = result.BlockedUntil
+	}
+	if result.Reason != "" && state.BlockReason == "" {
+		state.BlockReason = result.Reason
+	}
+}
+
+func (s *quotaState) recordAuthFileDisableResult(authID string, result authFileMutationResult, err error) {
+	if s == nil {
+		return
+	}
+	authID = strings.TrimSpace(authID)
+	if authID == "" {
+		authID = strings.TrimSpace(result.AuthID)
+	}
+	if authID == "" {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	state := s.ensureLocked(authID)
+	state.Provider = providerCodex
+	if result.Name != "" {
+		state.AuthFileName = result.Name
+	}
+	if result.Path != "" {
+		state.AuthFilePath = result.Path
+	}
+	if err != nil {
+		state.HostError = err.Error()
+		s.addEventLocked(authID, "host-error", err.Error())
+		return
+	}
+	state.HostError = ""
+	state.AuthFileDisabled = result.Disabled
+	state.AuthFileManaged = result.Managed
+	if result.Managed && result.Disabled {
+		s.addEventLocked(authID, "auth-file-disable", result.Message)
+	}
+	if !result.Managed && result.Message != "" {
+		s.addEventLocked(authID, "auth-file-skip", result.Message)
+	}
+}
+
+func (s *quotaState) recordAuthFileEnableResult(authID string, result authFileMutationResult, err error) {
+	if s == nil {
+		return
+	}
+	authID = strings.TrimSpace(authID)
+	if authID == "" {
+		authID = strings.TrimSpace(result.AuthID)
+	}
+	if authID == "" {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	state := s.ensureLocked(authID)
+	state.Provider = providerCodex
+	if result.Name != "" {
+		state.AuthFileName = result.Name
+	}
+	if result.Path != "" {
+		state.AuthFilePath = result.Path
+	}
+	if err != nil {
+		state.HostError = err.Error()
+		s.addEventLocked(authID, "host-error", err.Error())
+		return
+	}
+	state.HostError = ""
+	if result.Managed {
+		state.AuthFileDisabled = false
+		state.AuthFileManaged = false
+		state.BlockedUntil = time.Time{}
+		state.BlockReason = ""
+		state.ManualBlock = false
+		s.addEventLocked(authID, "auth-file-enable", result.Message)
+	}
+}
+
+func (s *quotaState) recordHostError(authID string, err error) {
+	if s == nil || err == nil {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if strings.TrimSpace(authID) != "" {
+		state := s.ensureLocked(authID)
+		state.Provider = providerCodex
+		state.HostError = err.Error()
+	}
+	s.addEventLocked(authID, "host-error", err.Error())
+}
+
 func candidateLabel(candidate pluginapi.SchedulerAuthCandidate) string {
 	for _, key := range []string{"email", "label", "account", "auth_index"} {
 		if value := strings.TrimSpace(candidate.Attributes[key]); value != "" {
@@ -497,19 +658,24 @@ func (s *quotaState) snapshot(now time.Time) stateSnapshot {
 	summary := stateSummary{}
 	for _, state := range s.records {
 		view := credentialView{
-			AuthID:       state.AuthID,
-			Provider:     state.Provider,
-			Label:        state.Label,
-			Model:        state.Model,
-			Status:       stateStatus(state, now),
-			Primary:      state.Primary,
-			Secondary:    state.Secondary,
-			BlockedUntil: state.BlockedUntil,
-			BlockReason:  state.BlockReason,
-			ManualBlock:  state.ManualBlock,
-			LastSeen:     state.LastSeen,
-			Last429At:    state.Last429At,
-			LastFailure:  state.LastFailure,
+			AuthID:           state.AuthID,
+			Provider:         state.Provider,
+			Label:            state.Label,
+			Model:            state.Model,
+			AuthFileName:     state.AuthFileName,
+			AuthFilePath:     state.AuthFilePath,
+			AuthFileDisabled: state.AuthFileDisabled,
+			AuthFileManaged:  state.AuthFileManaged,
+			HostError:        state.HostError,
+			Status:           stateStatus(state, now),
+			Primary:          state.Primary,
+			Secondary:        state.Secondary,
+			BlockedUntil:     state.BlockedUntil,
+			BlockReason:      state.BlockReason,
+			ManualBlock:      state.ManualBlock,
+			LastSeen:         state.LastSeen,
+			Last429At:        state.Last429At,
+			LastFailure:      state.LastFailure,
 		}
 		views = append(views, view)
 		summary.Total++
@@ -522,6 +688,8 @@ func (s *quotaState) snapshot(now time.Time) stateSnapshot {
 			summary.Cooling++
 		case statusManualBlock:
 			summary.ManualBlock++
+		case statusAuthDisabled:
+			summary.AuthDisabled++
 		}
 		if state.LastSeen.IsZero() {
 			summary.Stale++
@@ -547,6 +715,9 @@ func stateStatus(state *credentialState, now time.Time) string {
 			return statusManualBlock
 		}
 		return statusCooling
+	}
+	if state.AuthFileDisabled {
+		return statusAuthDisabled
 	}
 	if state.Primary.UsedPercent >= 90 || state.Secondary.UsedPercent >= 90 {
 		return statusNearLimit
