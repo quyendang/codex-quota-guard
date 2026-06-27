@@ -1,0 +1,120 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Build ${{ matrix.goos }} ${{ matrix.goarch }}
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - goos: linux
+            goarch: amd64
+            runner: ubuntu-latest
+            ext: so
+          - goos: darwin
+            goarch: amd64
+            runner: macos-13
+            ext: dylib
+          - goos: darwin
+            goarch: arm64
+            runner: macos-latest
+            ext: dylib
+          - goos: windows
+            goarch: amd64
+            runner: windows-latest
+            ext: dll
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.26.x"
+
+      - name: Install Windows C toolchain
+        if: matrix.goos == 'windows'
+        uses: msys2/setup-msys2@v2
+        with:
+          msystem: MINGW64
+          update: true
+          install: >-
+            mingw-w64-x86_64-gcc
+            zip
+
+      - name: Test
+        if: matrix.goos != 'windows'
+        run: go test ./...
+
+      - name: Test
+        if: matrix.goos == 'windows'
+        shell: msys2 {0}
+        run: go test ./...
+
+      - name: Build
+        if: matrix.goos != 'windows'
+        env:
+          CGO_ENABLED: "1"
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          NAME="codex-quota-guard"
+          ARCHIVE="${NAME}_${VERSION}_${{ matrix.goos }}_${{ matrix.goarch }}.zip"
+          mkdir -p dist/package
+          go build -buildmode=c-shared -o "dist/package/${NAME}.${{ matrix.ext }}" .
+          rm -f "dist/package/${NAME}.h"
+          (cd dist/package && zip -q -9 "../${ARCHIVE}" "${NAME}.${{ matrix.ext }}")
+
+      - name: Build
+        if: matrix.goos == 'windows'
+        shell: msys2 {0}
+        env:
+          CGO_ENABLED: "1"
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          NAME="codex-quota-guard"
+          ARCHIVE="${NAME}_${VERSION}_${{ matrix.goos }}_${{ matrix.goarch }}.zip"
+          mkdir -p dist/package
+          go build -buildmode=c-shared -o "dist/package/${NAME}.${{ matrix.ext }}" .
+          rm -f "dist/package/${NAME}.h"
+          (cd dist/package && zip -q -9 "../${ARCHIVE}" "${NAME}.${{ matrix.ext }}")
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: codex-quota-guard-${{ matrix.goos }}-${{ matrix.goarch }}
+          path: dist/*.zip
+          if-no-files-found: error
+
+  release:
+    name: Publish Release
+    needs: build
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      - name: Checksums
+        run: |
+          cd artifacts
+          sha256sum *.zip > checksums.txt
+
+      - name: Publish GitHub release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            artifacts/*.zip
+            artifacts/checksums.txt
