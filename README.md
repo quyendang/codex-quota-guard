@@ -27,7 +27,7 @@ Use the dynamic library extension for your platform:
 To create a Plugin Store asset for the current platform:
 
 ```bash
-./scripts/package.sh 0.1.0
+./scripts/package.sh 0.1.2
 ```
 
 Artifacts are written to `dist/`.
@@ -71,13 +71,13 @@ Manual actions call authenticated Management API endpoints and only mutate plugi
 
 ## Plugin Store Release
 
-Create a tag such as `v0.1.0`. The GitHub Actions release workflow builds these assets:
+Create a tag such as `v0.1.2`. The GitHub Actions release workflow builds these assets:
 
 ```text
-codex-quota-guard_0.1.0_darwin_amd64.zip
-codex-quota-guard_0.1.0_darwin_arm64.zip
-codex-quota-guard_0.1.0_linux_amd64.zip
-codex-quota-guard_0.1.0_windows_amd64.zip
+codex-quota-guard_0.1.2_darwin_amd64.zip
+codex-quota-guard_0.1.2_darwin_arm64.zip
+codex-quota-guard_0.1.2_linux_amd64.zip
+codex-quota-guard_0.1.2_windows_amd64.zip
 checksums.txt
 ```
 
@@ -97,7 +97,7 @@ Registry entry:
   "name": "Codex Quota Guard",
   "description": "Soft-blocks Codex credentials near 5-hour or weekly quota limits and returns them after reset.",
   "author": "quyen.eth",
-  "version": "0.1.0",
+  "version": "0.1.2",
   "repository": "https://github.com/quyendang/codex-quota-guard",
   "homepage": "https://github.com/quyendang/codex-quota-guard",
   "license": "MIT",
